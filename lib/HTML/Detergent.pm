@@ -8,7 +8,7 @@ use Moose;
 use namespace::autoclean;
 
 use Scalar::Util ();
-use URI ();
+use URI          ();
 use XML::LibXML  ();
 use XML::LibXSLT ();
 use XML::LibXML::LazyBuilder qw(DOM E);
@@ -22,15 +22,31 @@ has config => (
     required => 1,
 );
 
-has parser => (
+has xml_parser => (
+    is      => 'ro',
+    isa     => 'XML::LibXML',
+    default => sub { XML::LibXML->new(recover => 2) },
+    lazy    => 1,
+);
+
+has html_parser => (
     is      => 'ro',
     isa     => 'HTML::HTML5::Parser',
     default => sub { require HTML::HTML5::Parser; HTML::HTML5::Parser->new },
     lazy    => 1,
 );
 
-my $XPC = XML::LibXML::XPathContext->new;
-$XPC->registerNs('html' => 'http://www.w3.org/1999/xhtml');
+has xpc => (
+    is      => 'ro',
+    isa     => 'XML::LibXML::XPathContext',
+    default => sub {
+        my $xpc = XML::LibXML::XPathContext->new;
+        $xpc->registerNs('html' => 'http://www.w3.org/1999/xhtml');
+        return $xpc;
+    },
+);
+
+
 
 # XXX huh
 my %LINKS = (
@@ -70,11 +86,11 @@ HTML::Detergent - Clean the gunk off an HTML document
 
 =head1 VERSION
 
-Version 0.03
+Version 0.04
 
 =cut
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 =head1 SYNOPSIS
 
@@ -195,7 +211,9 @@ around BUILDARGS => sub {
     my $orig  = shift;
     my $class = shift;
 
-    my %p = ref $_[0] ? %{$_[0]} : @_;
+    return $class->$orig(config => $_[0]) if ref $_[0];
+
+    my %p = @_;
     $class->$orig(config => \%p);
 };
 
@@ -210,8 +228,8 @@ sub BUILD {
 
     # cache stylesheets
     for my $uri ($self->config->stylesheets) {
-        my $sheet = $xslt->parse_stylesheet_file($uri);
-        $SHEET{$uri} ||= $sheet;
+        $SHEET{$uri} ||= $xslt->parse_stylesheet_file($uri);
+        #$SHEET{$uri} ||= $sheet;
     }
 }
 
@@ -228,7 +246,7 @@ sub process {
 
     if (my $ref = ref $input) {
         if (Scalar::Util::reftype($input) eq 'GLOB') {
-            $input = eval { $self->parser->parse_fh($input) };
+            $input = eval { $self->html_parser->parse_fh($input) };
             Carp::croak("Failed to parse X(HT)ML input: $@") if $@;
         }
         elsif (Scalar::Util::blessed($input)
@@ -240,17 +258,18 @@ sub process {
         }
     }
     else {
-        $input = eval { $self->parser->parse_string($input) };
+        $input = eval { $self->html_parser->parse_string($input) };
         Carp::croak("Failed to parse X(HT)ML input: $@") if $@;
     }
 
+    my $xpc = $self->xpc;
     my $doc;
-    for my $xpath ($self->config->match_sequence) {
+    for my $xpath ($self->config->matches) {
         #warn $xpath;
 
         #warn substr($input->toString, 0, 100);
 
-        my @body = $XPC->findnodes($xpath, $input);
+        my @body = $xpc->findnodes($xpath, $input);
         #warn scalar @body;
         @body or next;
 
@@ -260,7 +279,9 @@ sub process {
         }
         else {
             my @head = map { $_->cloneNode(1) }
-                $XPC->findnodes('/html:html/html:head/*', $input);
+                $xpc->findnodes('/html:html/html:head/*', $input);
+
+            @body = map { $_->cloneNode(1) } @body;
 
             $doc = DOM E html => { xmlns => 'http://www.w3.org/1999/xhtml' },
                 (E head => {}, @head), (E body => {}, @body);
@@ -272,7 +293,7 @@ sub process {
     return $input unless $doc;
 
     # don't do this if not an HTML doc
-    if (my ($head) = $XPC->findnodes('/html:html/html:head', $doc)) {
+    if (my ($head) = $xpc->findnodes('/html:html/html:head', $doc)) {
         my $links = $self->config->links;
         for my $k (keys %$links) {
             for my $v (@{$links->{$k}}) {
@@ -308,7 +329,7 @@ sub process {
             my $olduri = $uri;
 
             # try to find a <base> element
-            my ($base) = $XPC->findnodes('html:base[1]', $head);
+            my ($base) = $xpc->findnodes('html:base[1]', $head);
             if ($base) {
                 # rewrite the old base
                 $olduri = URI->new($base->getAttribute('href'));
@@ -324,7 +345,7 @@ sub process {
             $base->setAttribute(href => $uri);
 
             # now traverse the document looking for URI-like attributes
-            for my $node ($XPC->findnodes($LINKXP, $doc)) {
+            for my $node ($xpc->findnodes($LINKXP, $doc)) {
                 my $t = $LINKS{$node->localName};
                 for my $u (keys %$t) {
                     if (defined (my $a = $node->getAttribute($u))) {
